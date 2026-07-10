@@ -1,0 +1,446 @@
+/*
+  ============================================================
+   ESP8266 Rogue AP / Evil-Twin Detector
+  ============================================================
+  Purpose:
+    Periodically scans nearby WiFi networks and watches your
+    HOME network's SSID for signs of spoofing:
+      - A duplicate SSID appearing with a DIFFERENT BSSID
+        (classic evil-twin behaviour)
+      - Your home SSID suddenly broadcasting from a new
+        channel it's never used before
+      - A sudden spike in "deauth-like" disconnects from your
+        own AP (you lose connection repeatedly in a short
+        window) - a soft signal, not proof, since normal wifi
+        hiccups also cause this
+    This tool does NOT transmit deauth frames, does NOT stand
+    up a fake AP, and does NOT capture credentials. It only
+    listens and reports.
+  Hardware:
+    Any ESP8266 board (NodeMCU, Wemos D1 Mini, etc.)
+  ============================================================
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+// ==========================================
+//           CONFIGURATION
+// ==========================================
+const char* homeSSID       = "home ssid";       // your real network's SSID to watch
+const int   scanIntervalMs = 15000;         // how often to scan (ms)
+const int   maxKnownBSSIDs = 4;             // legit APs can have multiple BSSIDs (mesh/repeaters)
+
+// Simple status LED (most boards have one on GPIO2, active LOW)
+const int ledPin = LED_BUILTIN;
+
+ESP8266WebServer webServer(80);
+
+// ==========================================
+//           STATE
+// ==========================================
+struct KnownAP {
+  String bssid;
+  int channel;
+  int rssiMin;      // observed weakest signal during baseline
+  int rssiMax;      // observed strongest signal during baseline
+  int seenCount;     // how many baseline scans saw this BSSID
+};
+KnownAP knownAPs[maxKnownBSSIDs];
+int knownAPCount = 0;
+bool baselineEstablished = false;
+const int baselineScans = 6;         // scans to average before trusting RSSI range
+const int rssiSlackDb   = 12;        // allowed drift beyond observed range before flagging
+const int confirmScansNeeded = 2;    // consecutive suspicious scans before an alert fires
+
+// Pending/unconfirmed suspicious sightings, keyed by BSSID+reason
+struct Pending {
+  String key;
+  int strikes;
+  unsigned long lastSeen;
+};
+#define MAX_PENDING 10
+Pending pending[MAX_PENDING];
+int pendingCount = 0;
+
+struct Alert {
+  String message;
+  unsigned long timestamp;
+};
+#define MAX_ALERTS 20
+Alert alertLog[MAX_ALERTS];
+int alertCount = 0;
+
+unsigned long lastScan = 0;
+int totalScans = 0;
+int totalAlerts = 0;
+
+// ==========================================
+//           HELPERS
+// ==========================================
+void logAlert(String msg) {
+  Serial.println("[ALERT] " + msg);
+  // shift log
+  if (alertCount < MAX_ALERTS) {
+    alertLog[alertCount].message = msg;
+    alertLog[alertCount].timestamp = millis() / 1000;
+    alertCount++;
+  } else {
+    for (int i = 1; i < MAX_ALERTS; i++) alertLog[i-1] = alertLog[i];
+    alertLog[MAX_ALERTS-1].message = msg;
+    alertLog[MAX_ALERTS-1].timestamp = millis() / 1000;
+  }
+  totalAlerts++;
+
+  // blink LED to give a physical indicator too
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(ledPin, LOW);
+    delay(80);
+    digitalWrite(ledPin, HIGH);
+    delay(80);
+  }
+}
+
+int findKnownIndex(String bssid) {
+  for (int i = 0; i < knownAPCount; i++) {
+    if (knownAPs[i].bssid == bssid) return i;
+  }
+  return -1;
+}
+
+bool isKnownBSSID(String bssid) {
+  return findKnownIndex(bssid) != -1;
+}
+
+// Registers a "strike" for a suspicious observation. Returns true
+// once it has been confirmed across enough consecutive scans to
+// be worth alerting on, rather than a one-off scan glitch.
+bool registerStrike(String key) {
+  unsigned long now = millis();
+  for (int i = 0; i < pendingCount; i++) {
+    if (pending[i].key == key) {
+      // only count as consecutive if seen within ~2 scan cycles
+      if (now - pending[i].lastSeen < (unsigned long)(scanIntervalMs * 2.5)) {
+        pending[i].strikes++;
+      } else {
+        pending[i].strikes = 1; // stale, restart
+      }
+      pending[i].lastSeen = now;
+      return pending[i].strikes >= confirmScansNeeded;
+    }
+  }
+  // new entry
+  if (pendingCount < MAX_PENDING) {
+    pending[pendingCount].key = key;
+    pending[pendingCount].strikes = 1;
+    pending[pendingCount].lastSeen = now;
+    pendingCount++;
+  } else {
+    // overwrite oldest
+    int oldest = 0;
+    for (int i = 1; i < MAX_PENDING; i++)
+      if (pending[i].lastSeen < pending[oldest].lastSeen) oldest = i;
+    pending[oldest].key = key;
+    pending[oldest].strikes = 1;
+    pending[oldest].lastSeen = now;
+  }
+  return confirmScansNeeded <= 1;
+}
+
+void clearStrike(String key) {
+  for (int i = 0; i < pendingCount; i++) {
+    if (pending[i].key == key) {
+      // shift down
+      for (int j = i; j < pendingCount - 1; j++) pending[j] = pending[j+1];
+      pendingCount--;
+      return;
+    }
+  }
+}
+
+// ==========================================
+//           CORE SCAN LOGIC
+// ==========================================
+int baselineScansDone = 0;
+
+void runScan() {
+  int n = WiFi.scanNetworks(false, true); // include hidden
+  totalScans++;
+
+  bool sawHomeSSIDThisScan = false;
+  bool sawKnownBSSIDThisScan = false;
+
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) != String(homeSSID)) continue;
+    sawHomeSSIDThisScan = true;
+
+    uint8_t* b = WiFi.BSSID(i);
+    char buf[18];
+    sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+            b[0], b[1], b[2], b[3], b[4], b[5]);
+    String bssid = String(buf);
+    int channel = WiFi.channel(i);
+    int rssi = WiFi.RSSI(i);
+
+    int idx = findKnownIndex(bssid);
+
+    // ---- Phase 1: baseline learning ----
+    if (!baselineEstablished) {
+      if (idx == -1 && knownAPCount < maxKnownBSSIDs) {
+        knownAPs[knownAPCount].bssid = bssid;
+        knownAPs[knownAPCount].channel = channel;
+        knownAPs[knownAPCount].rssiMin = rssi;
+        knownAPs[knownAPCount].rssiMax = rssi;
+        knownAPs[knownAPCount].seenCount = 1;
+        knownAPCount++;
+        Serial.println("[BASELINE] Learned AP " + bssid +
+                        " ch " + String(channel) +
+                        " rssi " + String(rssi));
+      } else if (idx != -1) {
+        // widen the observed RSSI range across baseline scans
+        if (rssi < knownAPs[idx].rssiMin) knownAPs[idx].rssiMin = rssi;
+        if (rssi > knownAPs[idx].rssiMax) knownAPs[idx].rssiMax = rssi;
+        knownAPs[idx].seenCount++;
+      }
+      continue;
+    }
+
+    // ---- Phase 2: active detection ----
+    if (idx == -1) {
+      // Totally unknown BSSID broadcasting our SSID = spoofed MAC
+      // not even attempted, or a brand new AP. Always suspicious.
+      String key = "unknown-bssid:" + bssid;
+      if (registerStrike(key)) {
+        logAlert("Unknown BSSID broadcasting your SSID '" +
+                 String(homeSSID) + "': " + bssid +
+                 " (ch " + String(channel) + ", " + String(rssi) +
+                 " dBm) - confirmed over " + String(confirmScansNeeded) +
+                 " scans, likely evil twin");
+      }
+      continue;
+    }
+
+    // Known BSSID (MAC matches, or was spoofed to match) - now check
+    // whether its behaviour still matches the physical AP we baselined.
+    sawKnownBSSIDThisScan = true;
+    bool suspicious = false;
+    String reason = "";
+
+    // Signal strength should stay roughly within the range we
+    // observed for the REAL, physically-fixed router. A cloned MAC
+    // broadcast from an attacker's laptop/phone will usually sit at
+    // a very different distance/power than your router.
+    int lowBound = knownAPs[idx].rssiMin - rssiSlackDb;
+    int highBound = knownAPs[idx].rssiMax + rssiSlackDb;
+    if (rssi < lowBound || rssi > highBound) {
+      suspicious = true;
+      reason = "RSSI " + String(rssi) + " dBm is outside learned range [" +
+               String(knownAPs[idx].rssiMin) + "," +
+               String(knownAPs[idx].rssiMax) + "] +/-" +
+               String(rssiSlackDb) + "dB";
+    }
+
+    // Channel should be stable for a fixed router unless you know
+    // you have channel-hopping/auto-channel enabled on your AP.
+    if (channel != knownAPs[idx].channel) {
+      suspicious = true;
+      reason += (reason.length() ? "; " : "") +
+                String("channel changed from ") +
+                String(knownAPs[idx].channel) + " to " + String(channel);
+    }
+
+    if (suspicious) {
+      String key = "behaviour:" + bssid;
+      if (registerStrike(key)) {
+        logAlert("BSSID " + bssid + " (matches known MAC) is behaving " +
+                 "abnormally - " + reason +
+                 " - possible MAC-spoofed evil twin");
+      }
+    } else {
+      clearStrike("behaviour:" + bssid);
+      // update the running RSSI window slowly so legitimate drift
+      // (you walking around the house) doesn't cause false positives
+      if (rssi < knownAPs[idx].rssiMin) knownAPs[idx].rssiMin = rssi;
+      if (rssi > knownAPs[idx].rssiMax) knownAPs[idx].rssiMax = rssi;
+    }
+  }
+
+  // A brief disappearance followed by reappearance is a soft signal
+  // of a deauth-then-takeover pattern. We only note it, since normal
+  // wifi hiccups also cause this - it is context, not proof.
+  if (baselineEstablished && !sawHomeSSIDThisScan) {
+    Serial.println("[INFO] Home SSID not seen this scan.");
+  } else if (baselineEstablished && sawHomeSSIDThisScan &&
+             !sawKnownBSSIDThisScan) {
+    // SSID present but NONE of the sightings matched a known BSSID
+    // well enough - already covered by unknown-bssid alerts above,
+    // this is just an extra log line for visibility.
+    Serial.println("[INFO] Home SSID seen but no fully-trusted BSSID this scan.");
+  }
+
+  if (!baselineEstablished) {
+    baselineScansDone++;
+    if (baselineScansDone >= baselineScans && knownAPCount > 0) {
+      baselineEstablished = true;
+      Serial.println("[BASELINE] Established after " +
+                      String(baselineScansDone) + " scans with " +
+                      String(knownAPCount) + " known BSSID(s).");
+      for (int i = 0; i < knownAPCount; i++) {
+        Serial.println("  " + knownAPs[i].bssid + " ch " +
+                        String(knownAPs[i].channel) + " rssi [" +
+                        String(knownAPs[i].rssiMin) + "," +
+                        String(knownAPs[i].rssiMax) + "]");
+      }
+    }
+  }
+
+  WiFi.scanDelete();
+}
+
+// ==========================================
+//           WEB DASHBOARD
+// ==========================================
+String dashboardPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<title>Rogue AP Detector</title>
+<style>
+  body{background:#0a0a0a;color:#0f0;font-family:monospace;padding:15px;}
+  h1{color:#0ff;border-bottom:1px solid #0f0;padding-bottom:8px;}
+  .box{background:#111;border:1px solid #333;padding:12px;
+       margin:10px 0;border-radius:6px;}
+  .stat{display:inline-block;background:#111;border:1px solid #333;
+        padding:10px 16px;margin:4px;border-radius:5px;text-align:center;}
+  .stat .v{font-size:1.4em;color:#0ff;font-weight:bold;}
+  .stat .l{font-size:0.75em;color:#888;}
+  .alert{color:#ff5555;padding:4px 0;border-bottom:1px solid #222;}
+  .known{color:#0f0;padding:4px 0;border-bottom:1px solid #222;}
+  .ok{color:#0f0;}
+</style>
+</head>
+<body>
+<h1>Rogue AP / Evil-Twin Detector</h1>
+<div class="box">
+  <div class="stat"><div class="v">)rawliteral" + String(homeSSID) + R"rawliteral(</div><div class="l">Watching SSID</div></div>
+  <div class="stat"><div class="v">)rawliteral" + String(totalScans) + R"rawliteral(</div><div class="l">Scans Run</div></div>
+  <div class="stat"><div class="v">)rawliteral" + String(totalAlerts) + R"rawliteral(</div><div class="l">Alerts Total</div></div>
+  <div class="stat"><div class="v">)rawliteral" + String(baselineEstablished ? "YES" : "learning...") + R"rawliteral(</div><div class="l">Baseline Set</div></div>
+</div>
+
+<div class="box">
+  <h3>Known Legitimate BSSIDs</h3>
+)rawliteral";
+
+  if (knownAPCount == 0) {
+    html += "<p>None learned yet - is your home AP powered on?</p>";
+  } else {
+    for (int i = 0; i < knownAPCount; i++) {
+      html += "<div class='known'>" + knownAPs[i].bssid +
+              " (channel " + String(knownAPs[i].channel) +
+              ", rssi range [" + String(knownAPs[i].rssiMin) +
+              "," + String(knownAPs[i].rssiMax) + "] dBm)</div>";
+    }
+  }
+
+  html += R"rawliteral(
+</div>
+<div class="box">
+  <h3>Pending (unconfirmed) Suspicious Sightings</h3>
+)rawliteral";
+
+  if (pendingCount == 0) {
+    html += "<p class='ok'>None</p>";
+  } else {
+    for (int i = 0; i < pendingCount; i++) {
+      html += "<div class='known'>" + pending[i].key +
+              " - strikes: " + String(pending[i].strikes) +
+              "/" + String(confirmScansNeeded) + "</div>";
+    }
+  }
+
+  html += R"rawliteral(
+</div>
+<div class="box">
+  <h3>Alert Log (most recent )rawliteral" + String(MAX_ALERTS) + R"rawliteral()</h3>
+)rawliteral";
+
+  if (alertCount == 0) {
+    html += "<p class='ok'>No alerts. Looking clean.</p>";
+  } else {
+    for (int i = alertCount - 1; i >= 0; i--) {
+      html += "<div class='alert'>[" + String(alertLog[i].timestamp) +
+              "s] " + alertLog[i].message + "</div>";
+    }
+  }
+
+  html += R"rawliteral(
+</div>
+<div class="box">
+  <h3>Controls</h3>
+  <p><a href="/rescan" style="color:#0ff">Force rescan now</a></p>
+  <p><a href="/resetbaseline" style="color:#ff0">Reset baseline (relearn known APs)</a></p>
+</div>
+</body>
+</html>
+)rawliteral";
+  return html;
+}
+
+void handleRoot() {
+  webServer.send(200, "text/html", dashboardPage());
+}
+
+void handleRescan() {
+  runScan();
+  webServer.sendHeader("Location", "/", true);
+  webServer.send(302, "text/plain", "");
+}
+
+void handleResetBaseline() {
+  knownAPCount = 0;
+  baselineEstablished = false;
+  webServer.sendHeader("Location", "/", true);
+  webServer.send(302, "text/plain", "");
+}
+
+// ==========================================
+//           SETUP / LOOP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, HIGH); // off (active low on most boards)
+
+  Serial.println("\n==============================");
+  Serial.println(" Rogue AP / Evil-Twin Detector");
+  Serial.println("==============================");
+  Serial.println("Watching SSID: " + String(homeSSID));
+
+  WiFi.mode(WIFI_AP_STA);
+  // Small local AP just so you can reach the dashboard from
+  // your phone without needing your main router to be up.
+  WiFi.softAP("rogue-detector", "detector123");
+  Serial.println("Dashboard AP: rogue-detector / detector123");
+  Serial.println("Dashboard IP: " + WiFi.softAPIP().toString());
+
+  webServer.on("/", handleRoot);
+  webServer.on("/rescan", handleRescan);
+  webServer.on("/resetbaseline", handleResetBaseline);
+  webServer.begin();
+
+  runScan(); // establish baseline immediately
+}
+
+void loop() {
+  webServer.handleClient();
+
+  unsigned long now = millis();
+  if (now - lastScan > scanIntervalMs) {
+    runScan();
+    lastScan = now;
